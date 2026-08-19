@@ -919,24 +919,32 @@ done
         else
             echo "✅ BD '$DB_NAME' ya existe; no se elimina ni reinicializa."
         fi
-
-        if [ "$DB_MODE" = "2" ] && [ -n "$SQL_FILE" ]; then
+if [ "$DB_MODE" = "2" ] && [ -n "$SQL_FILE" ]; then
             TABLE_COUNT=$(root_exec -N -B -e "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='$(sql_escape "$DB_NAME")';" 2>/dev/null || echo 0)
             if [ "$TABLE_COUNT" = "0" ]; then
                 echo "📥 Importando $(basename "$SQL_FILE")..."
+                
+                # 1. Copiamos el archivo físicamente dentro del contenedor para evitar errores de buffer o SSL
+                docker cp "$SQL_FILE" "$DB_CONTAINER:/tmp/archivo_import.sql"
+                
+                # 2. Ejecutamos la importación directamente desde adentro del contenedor
                 if [[ "$SQL_FILE" == *.gz ]]; then
                     if [ -n "$ROOT_PASSWORD_DETECTED" ]; then
-                        gzip -dc "$SQL_FILE" | docker exec -i "$DB_CONTAINER" "$MYSQL_BIN" -u root -p"$ROOT_PASSWORD_DETECTED" "$DB_NAME"
+                        docker exec "$DB_CONTAINER" sh -c "gzip -dc /tmp/archivo_import.sql | $MYSQL_BIN -u root -p\"$ROOT_PASSWORD_DETECTED\" \"$DB_NAME\""
                     else
-                        gzip -dc "$SQL_FILE" | docker exec -i "$DB_CONTAINER" "$MYSQL_BIN" -u root "$DB_NAME"
+                        docker exec "$DB_CONTAINER" sh -c "gzip -dc /tmp/archivo_import.sql | $MYSQL_BIN -u root \"$DB_NAME\""
                     fi
                 else
                     if [ -n "$ROOT_PASSWORD_DETECTED" ]; then
-                        docker exec -i "$DB_CONTAINER" "$MYSQL_BIN" -u root -p"$ROOT_PASSWORD_DETECTED" "$DB_NAME" < "$SQL_FILE"
+                        docker exec "$DB_CONTAINER" sh -c "$MYSQL_BIN -u root -p\"$ROOT_PASSWORD_DETECTED\" \"$DB_NAME\" < /tmp/archivo_import.sql"
                     else
-                        docker exec -i "$DB_CONTAINER" "$MYSQL_BIN" -u root "$DB_NAME" < "$SQL_FILE"
+                        docker exec "$DB_CONTAINER" sh -c "$MYSQL_BIN -u root \"$DB_NAME\" < /tmp/archivo_import.sql"
                     fi
                 fi
+                
+                # 3. Limpiamos el archivo temporal
+                docker exec "$DB_CONTAINER" rm -f /tmp/archivo_import.sql
+                
                 echo "✅ SQL importado."
             else
                 echo "ℹ️ La BD ya tiene $TABLE_COUNT tabla(s); se omite SQL para evitar duplicados."
