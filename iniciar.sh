@@ -932,4 +932,3 @@ echo "   $CARPETA_DESTINO/README-DEPLOY.txt"
 echo "-------------------------------------------------"
 echo "📌 La próxima ejecución usará otra instancia Pn y no tocará ésta."
 echo "================================================="
-
