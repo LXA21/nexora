@@ -334,6 +334,51 @@ extract_embedded_zips() {
 
 extract_embedded_zips
 
+# ------------------------------------------------------------------------------
+# 2.1 Búsqueda inteligente de la raíz web y Auto-Parche del Dockerfile
+# ------------------------------------------------------------------------------
+echo "================================================="
+echo "🔍 2.1 Analizando estructura del código fuente"
+echo "================================================="
+
+DOCKERFILE_PATH=$(find "$INSTANCE_SOURCE" -type f -name "Dockerfile" | head -n 1)
+
+if [ -n "$DOCKERFILE_PATH" ]; then
+    DOCKERFILE_DIR=$(dirname "$DOCKERFILE_PATH")
+    
+    # Buscar el archivo principal (index.php o index.html)
+    MAIN_INDEX=$(find "$DOCKERFILE_DIR" -type f \( -name "index.php" -o -name "index.html" \) | head -n 1)
+    
+    if [ -n "$MAIN_INDEX" ]; then
+        # Calcular en qué subcarpeta está escondido el index relativo al Dockerfile
+        REL_DIR=$(dirname "${MAIN_INDEX#$DOCKERFILE_DIR/}")
+        REL_DIR=$(echo "$REL_DIR" | sed 's/^\.\///')
+        
+        if [ "$REL_DIR" != "." ] && [ -n "$REL_DIR" ]; then
+            echo "🔧 Código anidado detectado en: '$REL_DIR'"
+            echo "   Inyectando corrección de DocumentRoot en el Dockerfile..."
+            
+            cat <<EOF >> "$DOCKERFILE_PATH"
+
+# --- AUTO-PATCH DEL INSTALADOR UNIVERSAL ---
+RUN sed -i 's|DocumentRoot /var/www/html|DocumentRoot /var/www/html/$REL_DIR|g' /etc/apache2/sites-available/000-default.conf || true
+RUN chown -R www-data:www-data /var/www/html || true
+EOF
+        else
+            echo "🔧 Código detectado en la raíz."
+            echo "   Inyectando corrección de permisos www-data..."
+            
+            cat <<EOF >> "$DOCKERFILE_PATH"
+
+# --- AUTO-PATCH DEL INSTALADOR UNIVERSAL ---
+RUN chown -R www-data:www-data /var/www/html || true
+EOF
+        fi
+    else
+        echo "⚠️ No se encontró index.php ni index.html para auto-configurar Apache."
+    fi
+fi
+
 INSTANCE_COMPOSE_FILE=""
 for f in docker-compose.yml docker-compose.yaml compose.yml compose.yaml; do
     if [ -f "$INSTANCE_SOURCE/$f" ]; then
@@ -353,6 +398,7 @@ REPO_DIR="$INSTANCE_SOURCE"
 
 COMPOSE_CONFIG=$(docker compose --env-file "$INSTANCE_ENV" -f "$COMPOSE_FILE" --project-directory "$REPO_DIR" config)
 mapfile -t SERVICES < <(docker compose --env-file "$INSTANCE_ENV" -f "$COMPOSE_FILE" --project-directory "$REPO_DIR" config --services)
+
 
 # ------------------------------------------------------------------------------
 # 3. Analizar servicio de BD e imagen exacta
