@@ -463,8 +463,123 @@ ENVFILE
 # compose up' falle con un error genérico de pull, se avisa explícitamente y
 # se pregunta cómo continuar (coherente con "si no se puede determinar, se
 # pregunta, no se asume").
+
+# Busca, entre TODOS los Dockerfile del repositorio (sin importar en qué
+# carpeta estén), el que mejor corresponde a un servicio. Empareja por
+# palabras clave: nombre del servicio, tokens del nombre de la imagen y,
+# si aplica, el motor de BD detectado. Se descartan tokens ruidosos de
+# menos de 3 caracteres (p.ej. "mi", "p1") salvo que sean exactamente el
+# nombre del servicio, para evitar falsos positivos como "mi" matcheando
+# dentro de "adMIn". Si hay empate entre varios candidatos, se pregunta
+# al usuario en vez de asumir — misma filosofía que el resto del script.
+match_dockerfile_for_service() {
+    local svc="$1" image="$2"
+    local svc_lower kw path_lower score best_score=0 image_no_tag entry sel i d
+    local -a keyword_list=() img_tokens=() scored_paths=() best_paths=()
+
+    svc_lower=$(echo "$svc" | tr '[:upper:]' '[:lower:]')
+    keyword_list+=("$svc_lower")
+
+    image_no_tag="${image%%:*}"
+    local IFS='/_.-'
+    read -r -a img_tokens <<< "$image_no_tag"
+    unset IFS
+    for kw in "${img_tokens[@]}"; do
+        kw=$(echo "$kw" | tr '[:upper:]' '[:lower:]')
+        [ -n "$kw" ] && keyword_list+=("$kw")
+    done
+
+    if [ -n "$DB_SERVICE" ] && [ "$svc" = "$DB_SERVICE" ] && [ -n "$DB_ENGINE" ]; then
+        keyword_list+=("$DB_ENGINE")
+        [ "$DB_ENGINE" = "mariadb" ] && keyword_list+=("mysql")
+        [ "$DB_ENGINE" = "mysql" ] && keyword_list+=("mariadb")
+    fi
+
+    for d in "${all_dockerfiles[@]}"; do
+        path_lower=$(echo "${d#$REPO_DIR/}" | tr '[:upper:]' '[:lower:]')
+        score=0
+        for kw in "${keyword_list[@]}"; do
+            if [ "${#kw}" -lt 3 ] && [ "$kw" != "$svc_lower" ]; then
+                continue
+            fi
+            case "$path_lower" in
+                *"$kw"*) score=$((score + 1)) ;;
+            esac
+        done
+        [ "$score" -gt 0 ] && scored_paths+=("$score|$d")
+    done
+
+    [ "${#scored_paths[@]}" -eq 0 ] && return 0
+
+    for entry in "${scored_paths[@]}"; do
+        local s="${entry%%|*}"
+        [ "$s" -gt "$best_score" ] && best_score="$s"
+    done
+    for entry in "${scored_paths[@]}"; do
+        local s="${entry%%|*}"
+        [ "$s" -eq "$best_score" ] && best_paths+=("${entry#*|}")
+    done
+
+    if [ "${#best_paths[@]}" -eq 1 ]; then
+        echo "${best_paths[0]}"
+        return 0
+    fi
+
+    echo "❓ Varios Dockerfile podrían pertenecer al servicio '$svc' (imagen '$image'):" >&2
+    for i in "${!best_paths[@]}"; do
+        echo "    $((i+1))) ${best_paths[$i]#$REPO_DIR/}" >&2
+    done
+    read -r -p "👉 Selecciona cuál usar (0 = ninguno) [0]: " sel
+    sel=${sel:-0}
+    if [[ "$sel" =~ ^[0-9]+$ ]] && [ "$sel" -ge 1 ] && [ "$sel" -le "${#best_paths[@]}" ]; then
+        echo "${best_paths[$((sel-1))]}"
+    fi
+    return 0
+}
+
+# Si un servicio no tiene Dockerfile propio ni imagen descargable, pero por
+# su ROL es claramente una BD conocida o un phpMyAdmin, se ofrece la imagen
+# oficial correspondiente para descargarla y volver a etiquetarla localmente
+# con el nombre que pide el compose. Es el mismo truco que usaba la versión
+# anterior del script (pull mariadb/phpmyadmin + docker tag a mi_p1_mysql /
+# mi_p1_pma), aquí generalizado para cualquier proyecto en vez de un nombre
+# fijo. Nunca se aplica sin que el usuario lo confirme.
+guess_upstream_image_for_service() {
+    local svc="$1" image="$2"
+    local svc_lower image_lower all_text t
+    local -a tokens=()
+
+    svc_lower=$(echo "$svc" | tr '[:upper:]' '[:lower:]')
+    image_lower=$(echo "${image%%:*}" | tr '[:upper:]' '[:lower:]')
+
+    if [ -n "$DB_SERVICE" ] && [ "$svc" = "$DB_SERVICE" ] && [ -n "$DB_ENGINE" ]; then
+        case "$DB_ENGINE" in
+            mariadb)  echo "mariadb:latest";  return 0 ;;
+            mysql)    echo "mysql:latest";    return 0 ;;
+            postgres) echo "postgres:latest"; return 0 ;;
+        esac
+    fi
+
+    # Coincidencia por TOKEN completo (no subcadena) para evitar falsos
+    # positivos como "pma" dentro de una palabra que no tiene relación.
+    all_text="$svc_lower $image_lower"
+    local IFS='/_.:- '
+    read -r -a tokens <<< "$all_text"
+    unset IFS
+    for t in "${tokens[@]}"; do
+        case "$t" in
+            pma|phpmyadmin|myadmin) echo "phpmyadmin:latest"; return 0 ;;
+        esac
+    done
+
+    return 0
+}
+
 preflight_check_images() {
-    local svc image has_build opt dockerfile_path build_context candidate
+    local svc image has_build opt dockerfile_path build_context resolved upstream_image confirm_tag confirm_only unico
+    local -a all_dockerfiles=()
+    mapfile -t all_dockerfiles < <(find "$REPO_DIR" -type f \( -iname 'Dockerfile' -o -iname 'Dockerfile.*' -o -iname '*.Dockerfile' \) ! -path '*/.git/*' 2>/dev/null | sort)
+
     for svc in "${SERVICES[@]}"; do
         has_build=$(printf '%s\n' "$COMPOSE_CONFIG" | awk -v s="  $svc:" '
             $0==s{inside=1;next} inside && /^  [A-Za-z0-9_.-]+:$/{exit}
@@ -483,31 +598,69 @@ preflight_check_images() {
             continue                       # se puede descargar de un registro
         fi
 
-        # Antes de advertir/fallar, buscar un Dockerfile propio del servicio
-        # y, si existe, intentar construir la imagen automáticamente.
-        dockerfile_path=""
-        for candidate in \
-            "$REPO_DIR/$svc/Dockerfile" \
-            "$REPO_DIR/docker/$svc/Dockerfile" \
-            "$REPO_DIR/$svc.Dockerfile" \
-            "$REPO_DIR/Dockerfile.$svc"; do
-            if [ -f "$candidate" ]; then
-                dockerfile_path="$candidate"
-                break
-            fi
-        done
+        # Ninguna de las anteriores aplicó: se prueban, en orden, tres
+        # estrategias de recuperación automática antes de advertir/fallar.
+        # Cada una pide confirmación cuando implica una suposición.
+        resolved=0
 
+        # 1) Un Dockerfile del repo emparejado por palabras clave.
+        dockerfile_path=""
+        if [ "${#all_dockerfiles[@]}" -gt 0 ]; then
+            dockerfile_path=$(match_dockerfile_for_service "$svc" "$image")
+        fi
         if [ -n "$dockerfile_path" ]; then
             build_context=$(dirname "$dockerfile_path")
             echo "🔨 El servicio '$svc' usa la imagen '$image' (no existe localmente ni en un registro),"
-            echo "    pero se encontró un Dockerfile en '$dockerfile_path'. Construyendo automáticamente..."
+            echo "    pero se encontró un Dockerfile relacionado en '${dockerfile_path#$REPO_DIR/}'. Construyendo automáticamente..."
             if docker build -t "$image" -f "$dockerfile_path" "$build_context"; then
                 echo "✅ Imagen '$image' construida correctamente para '$svc'."
-                continue
+                resolved=1
             else
                 echo "❌ Falló la construcción automática de la imagen '$image' para '$svc'."
             fi
         fi
+
+        # 2) ¿Es la BD detectada o "huele" a phpMyAdmin? Ofrecer la imagen
+        #    oficial y re-etiquetarla localmente con el nombre pedido.
+        if [ "$resolved" -eq 0 ]; then
+            upstream_image=$(guess_upstream_image_for_service "$svc" "$image")
+            if [ -n "$upstream_image" ]; then
+                echo "🧭 El servicio '$svc' usa la imagen '$image' (sin 'build:' y no descargable directamente),"
+                echo "    pero por su función parece corresponder a la imagen oficial '$upstream_image'."
+                read -r -p "👉 ¿Descargarla y etiquetarla localmente como '$image'? [S/n]: " confirm_tag
+                confirm_tag=${confirm_tag:-S}
+                if [[ "$confirm_tag" =~ ^[SsYy] ]]; then
+                    if docker pull "$upstream_image" && docker tag "$upstream_image" "$image"; then
+                        echo "✅ '$image' etiquetada localmente a partir de '$upstream_image'."
+                        resolved=1
+                    else
+                        echo "❌ No se pudo descargar/etiquetar '$upstream_image'."
+                    fi
+                fi
+            fi
+        fi
+
+        # 3) Último recurso: si en TODO el repo hay un único Dockerfile
+        #    (típico de un proyecto con un solo servicio de aplicación),
+        #    ofrecerlo aunque su ruta no haya coincidido por palabras clave.
+        if [ "$resolved" -eq 0 ] && [ "${#all_dockerfiles[@]}" -eq 1 ]; then
+            unico="${all_dockerfiles[0]}"
+            echo "❓ El servicio '$svc' usa la imagen '$image' y en el repositorio hay un único Dockerfile"
+            echo "    (${unico#$REPO_DIR/}), aunque su ruta no coincide por palabras clave."
+            read -r -p "👉 ¿Usarlo para construir '$image'? [s/N]: " confirm_only
+            confirm_only=${confirm_only:-N}
+            if [[ "$confirm_only" =~ ^[SsYy] ]]; then
+                build_context=$(dirname "$unico")
+                if docker build -t "$image" -f "$unico" "$build_context"; then
+                    echo "✅ Imagen '$image' construida correctamente para '$svc'."
+                    resolved=1
+                else
+                    echo "❌ Falló la construcción automática de la imagen '$image' para '$svc'."
+                fi
+            fi
+        fi
+
+        [ "$resolved" -eq 1 ] && continue
 
         echo "⚠️  El servicio '$svc' usa la imagen '$image', que no tiene 'build:',"
         echo "    no existe localmente y no se puede descargar de ningún registro."
@@ -684,3 +837,4 @@ echo "   docker compose -p '$COMPOSE_PROJECT_NAME' restart"
 echo "   docker compose -p '$COMPOSE_PROJECT_NAME' down"
 echo "   docker compose -p '$COMPOSE_PROJECT_NAME' up -d"
 echo "================================================="
+
