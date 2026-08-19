@@ -2,6 +2,7 @@ version: '3.8'
 
 services:
   app:
+    build: .
     image: mi_p1_web:latest
     container_name: ${PREFIX_CONTENEDOR}_app
     restart: unless-stopped
@@ -18,7 +19,7 @@ services:
       - db
 
   db:
-    image: mi_p1_mysql:latest
+    image: mariadb:latest
     container_name: ${PREFIX_CONTENEDOR}_db
     restart: unless-stopped
     environment:
@@ -32,7 +33,7 @@ services:
       - red_interna
 
   pma:
-    image: mi_p1_pma:latest
+    image: phpmyadmin:latest
     container_name: ${PREFIX_CONTENEDOR}_pma
     restart: unless-stopped
     environment:
