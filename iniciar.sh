@@ -403,7 +403,10 @@ while true; do
 done
 
 NOMBRE_CARPETA="P${CONTADOR}"
-COMPOSE_PROJECT_NAME="$NOMBRE_CARPETA"
+# Docker Compose exige nombres de proyecto en minúsculas (solo [a-z0-9_-],
+# empezando por letra o número). La carpeta visual (P1, P2...) puede seguir
+# en mayúscula porque es solo un nombre de directorio, son cosas distintas.
+COMPOSE_PROJECT_NAME=$(sanitize_name "$NOMBRE_CARPETA")
 mkdir -p "$CARPETA_DESTINO"
 
 # El archivo de compose queda también dentro de Pn para que el despliegue tenga
@@ -461,7 +464,7 @@ ENVFILE
 # se pregunta cómo continuar (coherente con "si no se puede determinar, se
 # pregunta, no se asume").
 preflight_check_images() {
-    local svc image has_build opt
+    local svc image has_build opt dockerfile_path build_context candidate
     for svc in "${SERVICES[@]}"; do
         has_build=$(printf '%s\n' "$COMPOSE_CONFIG" | awk -v s="  $svc:" '
             $0==s{inside=1;next} inside && /^  [A-Za-z0-9_.-]+:$/{exit}
@@ -478,6 +481,32 @@ preflight_check_images() {
         fi
         if docker manifest inspect "$image" >/dev/null 2>&1; then
             continue                       # se puede descargar de un registro
+        fi
+
+        # Antes de advertir/fallar, buscar un Dockerfile propio del servicio
+        # y, si existe, intentar construir la imagen automáticamente.
+        dockerfile_path=""
+        for candidate in \
+            "$REPO_DIR/$svc/Dockerfile" \
+            "$REPO_DIR/docker/$svc/Dockerfile" \
+            "$REPO_DIR/$svc.Dockerfile" \
+            "$REPO_DIR/Dockerfile.$svc"; do
+            if [ -f "$candidate" ]; then
+                dockerfile_path="$candidate"
+                break
+            fi
+        done
+
+        if [ -n "$dockerfile_path" ]; then
+            build_context=$(dirname "$dockerfile_path")
+            echo "🔨 El servicio '$svc' usa la imagen '$image' (no existe localmente ni en un registro),"
+            echo "    pero se encontró un Dockerfile en '$dockerfile_path'. Construyendo automáticamente..."
+            if docker build -t "$image" -f "$dockerfile_path" "$build_context"; then
+                echo "✅ Imagen '$image' construida correctamente para '$svc'."
+                continue
+            else
+                echo "❌ Falló la construcción automática de la imagen '$image' para '$svc'."
+            fi
         fi
 
         echo "⚠️  El servicio '$svc' usa la imagen '$image', que no tiene 'build:',"
