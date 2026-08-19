@@ -178,24 +178,78 @@ if [ -e "$REPO_DIR" ] && [ ! -d "$REPO_DIR/.git" ]; then
 fi
 
 # ------------------------------------------------------------------------------
-# 0.3 Clonar/actualizar sin destruir el repositorio
+# 0.3 Descargar/clonar repositorio sin destruir una copia existente
+# ------------------------------------------------------------------------------
+# El instalador admite:
+#   - URL Git normal (git clone/pull).
+#   - URL directa a un .zip (descarga + extracción).
+# Esto es importante porque los archivos de inicialización, incluido base.sql,
+# deben buscarse DENTRO DEL CONTENIDO EXTRAÍDO DEL REPOSITORIO, no en el archivo
+# comprimido ni en una ruta externa.
 # ------------------------------------------------------------------------------
 echo "================================================="
-echo "📥 0.3 Sincronizando repositorio"
+echo "📥 0.3 Obteniendo repositorio"
 echo "================================================="
 
-if [ -d "$REPO_DIR/.git" ]; then
-    git -C "$REPO_DIR" remote set-url origin "$REPO_URL"
-    if ! git -C "$REPO_DIR" pull --ff-only; then
-        echo "⚠️ No se pudo actualizar con pull --ff-only. Se conserva el código local."
+extract_repository_zip() {
+    local zip_file="$1" dest="$2" extract_dir top_count top_dir
+    extract_dir=$(mktemp -d)
+
+    echo "📦 Extrayendo repositorio ZIP..."
+    if ! unzip -q "$zip_file" -d "$extract_dir"; then
+        rm -rf "$extract_dir"
+        echo "❌ No se pudo extraer el ZIP del repositorio."
+        exit 1
     fi
-else
-    if [ -n "$SUDO" ]; then
-        $SUDO -u "$SUDO_USER_NAME" git clone "$REPO_URL" "$REPO_DIR"
+
+    # Muchos proveedores (GitHub/GitLab) meten todo dentro de una carpeta raíz
+    # como proyecto-main/. Si existe una sola carpeta raíz, usamos su contenido.
+    top_count=$(find "$extract_dir" -mindepth 1 -maxdepth 1 -type d | wc -l | tr -d ' ')
+    if [ "$top_count" = "1" ] && [ "$(find "$extract_dir" -mindepth 1 -maxdepth 1 -type f | wc -l | tr -d ' ')" = "0" ]; then
+        top_dir=$(find "$extract_dir" -mindepth 1 -maxdepth 1 -type d -print -quit)
     else
-        git clone "$REPO_URL" "$REPO_DIR"
+        top_dir="$extract_dir"
     fi
-fi
+
+    mkdir -p "$dest"
+    tar -C "$top_dir" -cf - . | tar -C "$dest" -xf -
+    rm -rf "$extract_dir"
+}
+
+REPO_URL_NO_QUERY="${REPO_URL%%\?*}"
+case "${REPO_URL_NO_QUERY,,}" in
+    *.zip)
+        ZIP_TMP=$(mktemp --suffix=.zip)
+        echo "⬇️ Descargando ZIP: $REPO_URL"
+        if ! curl -fL --retry 3 --connect-timeout 20 "$REPO_URL" -o "$ZIP_TMP"; then
+            rm -f "$ZIP_TMP"
+            echo "❌ No se pudo descargar el ZIP del repositorio."
+            exit 1
+        fi
+        if [ -e "$REPO_DIR" ]; then
+            echo "❌ Ya existe '$REPO_DIR'. Para un repositorio ZIP no se sobrescribirá una copia existente."
+            rm -f "$ZIP_TMP"
+            exit 1
+        fi
+        mkdir -p "$REPO_DIR"
+        extract_repository_zip "$ZIP_TMP" "$REPO_DIR"
+        rm -f "$ZIP_TMP"
+        ;;
+    *)
+        if [ -d "$REPO_DIR/.git" ]; then
+            git -C "$REPO_DIR" remote set-url origin "$REPO_URL"
+            if ! git -C "$REPO_DIR" pull --ff-only; then
+                echo "⚠️ No se pudo actualizar con pull --ff-only. Se conserva el código local."
+            fi
+        else
+            if [ -n "$SUDO" ]; then
+                $SUDO -u "$SUDO_USER_NAME" git clone "$REPO_URL" "$REPO_DIR"
+            else
+                git clone "$REPO_URL" "$REPO_DIR"
+            fi
+        fi
+        ;;
+esac
 
 $SUDO chown -R "$SUDO_USER_NAME:$SUDO_USER_NAME" "$REPO_DIR" 2>/dev/null || true
 
@@ -220,8 +274,13 @@ echo "================================================="
 echo "🔎 1. Analizando proyecto"
 echo "================================================="
 
-docker compose -f "$COMPOSE_FILE" config >/dev/null
-mapfile -t SERVICES < <(docker compose -f "$COMPOSE_FILE" config --services)
+# Primera validación: solo necesitamos descubrir servicios. Se proporcionan
+# valores vacíos para variables administradas por el instalador que todavía
+# no han sido calculadas, evitando WARN de Compose por variables no definidas.
+PREFIX_CONTENEDOR="${PREFIX_CONTENEDOR:-}" COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT_NAME:-}" \
+    docker compose -f "$COMPOSE_FILE" config >/dev/null
+mapfile -t SERVICES < <(PREFIX_CONTENEDOR="${PREFIX_CONTENEDOR:-}" COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT_NAME:-}" \
+    docker compose -f "$COMPOSE_FILE" config --services)
 [ "${#SERVICES[@]}" -gt 0 ] || { echo "❌ Compose no contiene servicios."; exit 1; }
 
 printf '   • %s\n' "${SERVICES[@]}"
@@ -266,6 +325,37 @@ printf '\nCOMPOSE_PROJECT_NAME=%s\nPREFIX_CONTENEDOR=%s\nPROJECT_NAME=%s\nPROJEC
 mkdir -p "$INSTANCE_SOURCE"
 tar -C "$REPO_DIR" --exclude='./.git' -cf - . | tar -C "$INSTANCE_SOURCE" -xf -
 
+# Si el repositorio contiene archivos ZIP adicionales (por ejemplo, un
+# paquete que contiene base.sql), también se extraen dentro de la instancia.
+# Esto NO borra los ZIP originales y evita que base.sql quede invisible para
+# la búsqueda posterior. Se procesan también ZIP anidados hasta 5 niveles.
+extract_embedded_zips() {
+    local pass zip_file key out_dir found
+    declare -A ZIP_DONE=()
+
+    for pass in 1 2 3 4 5; do
+        found=0
+        while IFS= read -r -d '' zip_file; do
+            key=$(printf '%s' "$zip_file" | sha256sum | awk '{print $1}')
+            [ -n "${ZIP_DONE[$key]:-}" ] && continue
+            ZIP_DONE[$key]=1
+            found=1
+
+            out_dir="$INSTANCE_SOURCE/.zip_extract/$key"
+            mkdir -p "$out_dir"
+            echo "📦 Extrayendo paquete interno: ${zip_file#$INSTANCE_SOURCE/}"
+            if ! unzip -oq "$zip_file" -d "$out_dir"; then
+                echo "❌ No se pudo extraer: ${zip_file#$INSTANCE_SOURCE/}"
+                return 1
+            fi
+        done < <(find "$INSTANCE_SOURCE" -type f -iname '*.zip' ! -path '*/.git/*' -print0)
+
+        [ "$found" -eq 0 ] && break
+    done
+}
+
+extract_embedded_zips
+
 INSTANCE_COMPOSE_FILE=""
 for f in docker-compose.yml docker-compose.yaml compose.yml compose.yaml; do
     if [ -f "$INSTANCE_SOURCE/$f" ]; then
@@ -283,10 +373,15 @@ COMPOSE_FILE="$INSTANCE_COMPOSE_FILE"
 REPO_DIR_ORIGINAL="$REPO_DIR"
 REPO_DIR="$INSTANCE_SOURCE"
 
+# Revalidación REAL sobre la instancia, usando su .env de instancia. A partir
+# de aquí esta es la configuración que se desplegará y que se utilizará para
+# localizar servicios, BD, puertos, volúmenes y SQL.
+COMPOSE_CONFIG=$(docker compose --env-file "$INSTANCE_ENV" -f "$COMPOSE_FILE" --project-directory "$REPO_DIR" config)
+mapfile -t SERVICES < <(docker compose --env-file "$INSTANCE_ENV" -f "$COMPOSE_FILE" --project-directory "$REPO_DIR" config --services)
+
 # ------------------------------------------------------------------------------
 # 3. Analizar servicio de BD e imagen exacta
 # ------------------------------------------------------------------------------
-COMPOSE_CONFIG=$(docker compose -f "$COMPOSE_FILE" --project-directory "$REPO_DIR" config)
 
 DB_SERVICE=""
 DB_ENGINE=""
@@ -395,19 +490,49 @@ if [ -n "$DB_SERVICE" ]; then
     fi
 
     if [ "$DB_MODE" = "2" ]; then
-        mapfile -t SQL_FILES < <(find "$REPO_DIR" -type f \( -iname '*.sql' -o -iname '*.sql.gz' \) ! -path '*/.git/*' ! -path "$CARPETA_DESTINO/*" | sort)
+        # La búsqueda SIEMPRE se realiza sobre el contenido ya descargado y
+        # extraído de la instancia. Esto permite que base.sql esté dentro de
+        # una carpeta del ZIP (por ejemplo proyecto-main/base.sql) y aun así
+        # sea localizado.
+        echo "🔎 Buscando archivos SQL dentro del contenido extraído (incluidos paquetes ZIP internos)..."
+        mapfile -t SQL_FILES < <(find "$REPO_DIR" -type f \( -iname '*.sql' -o -iname '*.sql.gz' \) ! -path '*/.git/*' | sort)
+
         if [ "${#SQL_FILES[@]}" -eq 0 ]; then
-            echo "❌ Se solicitó importar SQL pero no hay archivos SQL."
-            exit 1
-        elif [ "${#SQL_FILES[@]}" -eq 1 ]; then
-            SQL_FILE="${SQL_FILES[0]}"
+            echo "⚠️ Se seleccionó importar SQL, pero no se encontró ningún archivo .sql/.sql.gz."
+            echo "   La BD '$DB_NAME' se creará/usará normalmente y NO se realizará ninguna importación."
+            echo "   El despliegue continuará; no se considera un error fatal."
+            SQL_FILE=""
         else
-            echo "📄 SQL encontrados:"
-            for i in "${!SQL_FILES[@]}"; do echo "   $((i+1))) ${SQL_FILES[$i]#$REPO_DIR/}"; done
-            read -r -p "👉 Selección [1]: " SQL_INDEX
-            SQL_INDEX=${SQL_INDEX:-1}
-            [[ "$SQL_INDEX" =~ ^[0-9]+$ ]] && [ "$SQL_INDEX" -ge 1 ] && [ "$SQL_INDEX" -le "${#SQL_FILES[@]}" ] || { echo "❌ Selección inválida."; exit 1; }
-            SQL_FILE="${SQL_FILES[$((SQL_INDEX-1))]}"
+            # Si existe base.sql/base.sql.gz, se prioriza porque es el nombre
+            # convencional del script de datos iniciales. Si hay varios SQL y
+            # ninguno es base.sql, se mantiene la selección manual.
+            PREFERRED_SQL=""
+            for candidate in "${SQL_FILES[@]}"; do
+                base=$(basename "$candidate")
+                case "${base,,}" in
+                    base.sql|base.sql.gz)
+                        PREFERRED_SQL="$candidate"
+                        break
+                        ;;
+                esac
+            done
+
+            if [ -n "$PREFERRED_SQL" ]; then
+                SQL_FILE="$PREFERRED_SQL"
+                echo "📄 SQL inicial detectado: ${SQL_FILE#$REPO_DIR/}"
+            elif [ "${#SQL_FILES[@]}" -eq 1 ]; then
+                SQL_FILE="${SQL_FILES[0]}"
+                echo "📄 SQL detectado: ${SQL_FILE#$REPO_DIR/}"
+            else
+                echo "📄 SQL encontrados en el repositorio extraído:"
+                for i in "${!SQL_FILES[@]}"; do
+                    echo "   $((i+1))) ${SQL_FILES[$i]#$REPO_DIR/}"
+                done
+                read -r -p "👉 Selección [1]: " SQL_INDEX
+                SQL_INDEX=${SQL_INDEX:-1}
+                [[ "$SQL_INDEX" =~ ^[0-9]+$ ]] && [ "$SQL_INDEX" -ge 1 ] && [ "$SQL_INDEX" -le "${#SQL_FILES[@]}" ] || { echo "❌ Selección inválida."; exit 1; }
+                SQL_FILE="${SQL_FILES[$((SQL_INDEX-1))]}"
+            fi
         fi
     fi
 fi
@@ -702,6 +827,8 @@ DB_SERVICE=$DB_SERVICE
 DB_ENGINE=$DB_ENGINE
 DB_IMAGE=$DB_IMAGE
 DB_DATABASE=$DB_NAME
+SQL_FILE=${SQL_FILE:-}
+SQL_IMPORT_REQUESTED=$([ "$DB_MODE" = "2" ] && echo yes || echo no)
 CREATED_AT=$(date -Is)
 VOLUME_POLICY=INSTANCE_ISOLATED
 DESTRUCTIVE_VOLUME_OPERATION=NEVER_AUTOMATIC
@@ -919,6 +1046,13 @@ echo "🐳 Proyecto Docker      : $COMPOSE_PROJECT_NAME"
 echo "🗄️ Servicio BD          : ${DB_SERVICE:-No detectado}"
 echo "🔧 Motor BD             : ${DB_ENGINE:-No determinado}"
 echo "💾 Base de datos        : ${DB_NAME:-No gestionada}"
+if [ "$DB_MODE" = "2" ]; then
+    if [ -n "$SQL_FILE" ]; then
+        echo "📄 SQL inicial          : ${SQL_FILE#$REPO_DIR/}"
+    else
+        echo "📄 SQL inicial          : No encontrado (se omitió importación)"
+    fi
+fi
 echo "🌐 IP servidor          : $IP_SERVIDOR"
 echo "🔌 Puerto web           : $PUERTO_WEB"
 echo "🔐 Puerto SSL           : $PUERTO_SSL"
