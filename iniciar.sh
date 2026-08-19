@@ -387,14 +387,14 @@ fi
 CONTADOR=1
 while true; do
     CARPETA_DESTINO="$ESCRITORIO/P${CONTADOR}"
-    if [ ! -e "$CARPETA_DESTINO" ] && ! docker ps -a --format '{{.Names}}' | grep -q "^P${CONTADOR}_"; then
+    if [ ! -e "$CARPETA_DESTINO" ] && ! docker ps -a --format '{{.Names}}' | grep -q "^p${CONTADOR}_"; then
         break
     fi
     CONTADOR=$((CONTADOR + 1))
 done
 
 NOMBRE_CARPETA="P${CONTADOR}"
-COMPOSE_PROJECT_NAME="$NOMBRE_CARPETA"
+COMPOSE_PROJECT_NAME="p${CONTADOR}"
 mkdir -p "$CARPETA_DESTINO"
 
 # El archivo de compose queda también dentro de Pn para que el despliegue tenga
