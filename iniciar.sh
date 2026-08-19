@@ -180,13 +180,6 @@ fi
 # ------------------------------------------------------------------------------
 # 0.3 Descargar/clonar repositorio sin destruir una copia existente
 # ------------------------------------------------------------------------------
-# El instalador admite:
-#   - URL Git normal (git clone/pull).
-#   - URL directa a un .zip (descarga + extracción).
-# Esto es importante porque los archivos de inicialización, incluido base.sql,
-# deben buscarse DENTRO DEL CONTENIDO EXTRAÍDO DEL REPOSITORIO, no en el archivo
-# comprimido ni en una ruta externa.
-# ------------------------------------------------------------------------------
 echo "================================================="
 echo "📥 0.3 Obteniendo repositorio"
 echo "================================================="
@@ -202,8 +195,6 @@ extract_repository_zip() {
         exit 1
     fi
 
-    # Muchos proveedores (GitHub/GitLab) meten todo dentro de una carpeta raíz
-    # como proyecto-main/. Si existe una sola carpeta raíz, usamos su contenido.
     top_count=$(find "$extract_dir" -mindepth 1 -maxdepth 1 -type d | wc -l | tr -d ' ')
     if [ "$top_count" = "1" ] && [ "$(find "$extract_dir" -mindepth 1 -maxdepth 1 -type f | wc -l | tr -d ' ')" = "0" ]; then
         top_dir=$(find "$extract_dir" -mindepth 1 -maxdepth 1 -type d -print -quit)
@@ -274,9 +265,6 @@ echo "================================================="
 echo "🔎 1. Analizando proyecto"
 echo "================================================="
 
-# Primera validación: solo necesitamos descubrir servicios. Se proporcionan
-# valores vacíos para variables administradas por el instalador que todavía
-# no han sido calculadas, evitando WARN de Compose por variables no definidas.
 PREFIX_CONTENEDOR="${PREFIX_CONTENEDOR:-}" COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT_NAME:-}" \
     docker compose -f "$COMPOSE_FILE" config >/dev/null
 mapfile -t SERVICES < <(PREFIX_CONTENEDOR="${PREFIX_CONTENEDOR:-}" COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT_NAME:-}" \
@@ -308,9 +296,6 @@ INSTANCE_SOURCE="$CARPETA_DESTINO/source"
 INSTANCE_ENV="$CARPETA_DESTINO/.env"
 MANIFEST="$CARPETA_DESTINO/deployment.env"
 
-# Cada instancia conserva una copia de las variables originales del proyecto,
-# pero sus variables de instancia se añaden/sobrescriben en este archivo.
-# Así no se pierde configuración legítima del .env original.
 if [ -f "$REPO_DIR/.env" ]; then
     cp "$REPO_DIR/.env" "$INSTANCE_ENV"
 else
@@ -319,16 +304,9 @@ fi
 printf '\nCOMPOSE_PROJECT_NAME=%s\nPREFIX_CONTENEDOR=%s\nPROJECT_NAME=%s\nPROJECT_SOURCE=%s\n' \
     "$COMPOSE_PROJECT_NAME" "$COMPOSE_PROJECT_NAME" "$SYSTEM_NAME" "$CARPETA_DESTINO/source" >> "$INSTANCE_ENV"
 
-# Cada instancia recibe una copia de trabajo del repositorio. Esto es deliberado:
-# si el Compose usa bind mounts relativos como ./data:/var/lib/..., P1 y P2 no
-# terminarán escribiendo en la misma carpeta del repositorio original.
 mkdir -p "$INSTANCE_SOURCE"
 tar -C "$REPO_DIR" --exclude='./.git' -cf - . | tar -C "$INSTANCE_SOURCE" -xf -
 
-# Si el repositorio contiene archivos ZIP adicionales (por ejemplo, un
-# paquete que contiene base.sql), también se extraen dentro de la instancia.
-# Esto NO borra los ZIP originales y evita que base.sql quede invisible para
-# la búsqueda posterior. Se procesan también ZIP anidados hasta 5 niveles.
 extract_embedded_zips() {
     local pass zip_file key out_dir found
     declare -A ZIP_DONE=()
@@ -359,7 +337,8 @@ extract_embedded_zips
 INSTANCE_COMPOSE_FILE=""
 for f in docker-compose.yml docker-compose.yaml compose.yml compose.yaml; do
     if [ -f "$INSTANCE_SOURCE/$f" ]; then
-        INSTANCE_COMPOSE_FILE="$INSTANCE_SOURCE/$f"
+        grep -vE '^version:[[:space:]]*["'\'']?[0-9.]+["'\'']?' "$INSTANCE_SOURCE/$f" > "$INSTANCE_SOURCE/.universal-compose.yml"
+        INSTANCE_COMPOSE_FILE="$INSTANCE_SOURCE/.universal-compose.yml"
         break
     fi
 done
@@ -367,15 +346,11 @@ done
 
 [ -f "$REPO_DIR/.env.example" ] && cp "$REPO_DIR/.env.example" "$CARPETA_DESTINO/.env.example" || true
 
-# Desde este punto el Compose que se ejecuta pertenece a la instancia aislada.
 ORIGINAL_COMPOSE_FILE="$COMPOSE_FILE"
 COMPOSE_FILE="$INSTANCE_COMPOSE_FILE"
 REPO_DIR_ORIGINAL="$REPO_DIR"
 REPO_DIR="$INSTANCE_SOURCE"
 
-# Revalidación REAL sobre la instancia, usando su .env de instancia. A partir
-# de aquí esta es la configuración que se desplegará y que se utilizará para
-# localizar servicios, BD, puertos, volúmenes y SQL.
 COMPOSE_CONFIG=$(docker compose --env-file "$INSTANCE_ENV" -f "$COMPOSE_FILE" --project-directory "$REPO_DIR" config)
 mapfile -t SERVICES < <(docker compose --env-file "$INSTANCE_ENV" -f "$COMPOSE_FILE" --project-directory "$REPO_DIR" config --services)
 
@@ -391,7 +366,6 @@ DB_USER_DETECTED=""
 DB_PASSWORD_DETECTED=""
 ROOT_PASSWORD_DETECTED=""
 
-# Primero se prefieren nombres explícitos y luego heurística.
 for preferred in mysql mariadb db database postgres postgresql; do
     for svc in "${SERVICES[@]}"; do
         if [ "$(printf '%s' "$svc" | tr '[:upper:]' '[:lower:]')" = "$preferred" ]; then
@@ -490,10 +464,6 @@ if [ -n "$DB_SERVICE" ]; then
     fi
 
     if [ "$DB_MODE" = "2" ]; then
-        # La búsqueda SIEMPRE se realiza sobre el contenido ya descargado y
-        # extraído de la instancia. Esto permite que base.sql esté dentro de
-        # una carpeta del ZIP (por ejemplo proyecto-main/base.sql) y aun así
-        # sea localizado.
         echo "🔎 Buscando archivos SQL dentro del contenido extraído (incluidos paquetes ZIP internos)..."
         mapfile -t SQL_FILES < <(find "$REPO_DIR" -type f \( -iname '*.sql' -o -iname '*.sql.gz' \) ! -path '*/.git/*' | sort)
 
@@ -503,9 +473,6 @@ if [ -n "$DB_SERVICE" ]; then
             echo "   El despliegue continuará; no se considera un error fatal."
             SQL_FILE=""
         else
-            # Si existe base.sql/base.sql.gz, se prioriza porque es el nombre
-            # convencional del script de datos iniciales. Si hay varios SQL y
-            # ninguno es base.sql, se mantiene la selección manual.
             PREFERRED_SQL=""
             for candidate in "${SQL_FILES[@]}"; do
                 base=$(basename "$candidate")
@@ -588,8 +555,6 @@ PUERTO_PMA=$(next_free_port "$BASE_PMA" 2)
 PUERTO_DB=$(next_free_port "$BASE_DB" 1)
 PUERTO_SSL=$(next_free_port "$BASE_SSL" 2)
 
-# Actualizar solamente las variables administradas por el instalador, preservando
-# las demás variables que ya pertenecían al proyecto.
 python3 - "$INSTANCE_ENV" "$COMPOSE_PROJECT_NAME" "$SYSTEM_NAME" "$INSTANCE_SOURCE" "$PUERTO_WEB" "$PUERTO_PMA" "$PUERTO_DB" "$PUERTO_SSL" "$DB_NAME" "$DB_APP_USER" "$DB_APP_PASS" <<'PY'
 import sys, os
 p=sys.argv[1]
@@ -639,8 +604,6 @@ render_compose() {
 RENDERED_JSON=$(render_compose)
 printf '%s\n' "$RENDERED_JSON" > "$CARPETA_DESTINO/compose.rendered.json"
 
-# Python devuelve hallazgos de recursos con nombre fijo, externos, container_name,
-# puertos y mounts. Se usa solo stdlib; no se instala jq.
 ANALYSIS_FILE="$CARPETA_DESTINO/resource-analysis.txt"
 printf "%s\n" "$RENDERED_JSON" > "$CARPETA_DESTINO/compose.rendered.json.tmp"
 python3 - "$CARPETA_DESTINO/compose.rendered.json.tmp" "$ANALYSIS_FILE" <<'PY'
@@ -691,7 +654,6 @@ echo "================================================="
 
 CONFLICT=0
 
-# container_name fijo: dos instancias no pueden compartirlo.
 while IFS='|' read -r kind svc cname; do
     [ "$kind" = "CONTAINER_NAME" ] || continue
     if docker ps -a --format '{{.Names}}' | grep -Fxq "$cname"; then
@@ -701,8 +663,6 @@ while IFS='|' read -r kind svc cname; do
     fi
 done < "$ANALYSIS_FILE"
 
-# Volúmenes externos o con name: fijo no se aceptan para una NUEVA instancia,
-# porque podrían apuntar a datos de P1/P2/... anteriores.
 while IFS='|' read -r kind vname namepart externalpart; do
     [ "$kind" = "VOLUME" ] || continue
     fixed_name="${namepart#name=}"
@@ -718,7 +678,6 @@ while IFS='|' read -r kind vname namepart externalpart; do
     fi
 done < "$ANALYSIS_FILE"
 
-# Redes externas/nombre fijo tienen el mismo problema de namespace.
 while IFS='|' read -r kind nname namepart externalpart; do
     [ "$kind" = "NETWORK" ] || continue
     fixed_name="${namepart#name=}"
@@ -734,7 +693,6 @@ while IFS='|' read -r kind nname namepart externalpart; do
     fi
 done < "$ANALYSIS_FILE"
 
-# Bind mounts fuera de la instancia: pueden compartir datos con otra ejecución.
 while IFS='|' read -r kind svc typ source target; do
     [ "$kind" = "MOUNT" ] || continue
     if [ "$typ" = "bind" ]; then
@@ -749,7 +707,6 @@ while IFS='|' read -r kind svc typ source target; do
     fi
 done < "$ANALYSIS_FILE"
 
-# Puertos: se comprueban después de renderizar, no solo los candidatos.
 while IFS='|' read -r kind svc host target proto; do
     [ "$kind" = "PORT" ] || continue
     [ -n "$host" ] || continue
@@ -760,8 +717,6 @@ while IFS='|' read -r kind svc host target proto; do
     fi
 done < "$ANALYSIS_FILE"
 
-# Detectar explícitamente si los puertos de la instancia resultaron iguales a los
-# puertos publicados por un proyecto Docker anterior.
 while IFS='|' read -r kind svc host target proto; do
     [ "$kind" = "PORT" ] || continue
     [ -n "$host" ] || continue
@@ -786,7 +741,7 @@ echo "✅ No se detectaron recursos fijos/external que puedan colisionar."
 # 8. Preflight de imágenes: conservar exactamente la imagen declarada
 # ------------------------------------------------------------------------------
 preflight_images() {
-    local svc image has_build
+    local svc image has_build dockerfile_path
     for svc in "${SERVICES[@]}"; do
         has_build=$(printf '%s\n' "$COMPOSE_CONFIG" | awk -v s="  $svc:" '
             $0==s{inside=1;next} inside && /^  [A-Za-z0-9_.-]+:/{exit}
@@ -798,16 +753,39 @@ preflight_images() {
         [ -n "$has_build" ] && continue
         [ -n "$image" ] || continue
 
+        # 1. ¿Existe localmente?
         if docker image inspect "$image" >/dev/null 2>&1; then
-            echo "✅ Imagen disponible: $svc -> $image"
-        elif docker manifest inspect "$image" >/dev/null 2>&1; then
-            echo "⬇️ Imagen descargable: $svc -> $image"
-            docker pull "$image"
-        else
-            echo "❌ No se puede obtener la imagen declarada '$image' para '$svc'."
-            echo "   El instalador universal NO sustituirá automáticamente por ':latest'."
-            exit 1
+            echo "✅ Imagen disponible localmente: $svc -> $image"
+            continue
         fi
+
+        # 2. ¿Existe un contenedor anterior con esa imagen? (Recuperar/Taggear)
+        OLD_CONTAINER=$(docker ps -a --filter "ancestor=$image" --format '{{.ID}}' | head -n 1)
+        if [ -n "$OLD_CONTAINER" ]; then
+            echo "🔄 Recuperando imagen de contenedor anterior: $OLD_CONTAINER -> $image"
+            docker commit "$OLD_CONTAINER" "$image" >/dev/null
+            continue
+        fi
+
+        # 3. ¿Se puede descargar exactamente esa imagen?
+        if docker manifest inspect "$image" >/dev/null 2>&1; then
+            echo "⬇️ Descargando imagen: $svc -> $image"
+            docker pull "$image"
+            continue
+        fi
+
+        # 4. ¿Existe Dockerfile en el contenido extraído (incluye .zip_extract)?
+        dockerfile_path=$(find "$INSTANCE_SOURCE" -type f -name "Dockerfile" | head -n 1)
+        if [ -n "$dockerfile_path" ]; then
+            echo "🔨 Construyendo imagen '$image' desde $(dirname "$dockerfile_path")..."
+            docker build -t "$image" "$(dirname "$dockerfile_path")"
+            continue
+        fi
+
+        # Falla solo si se agotan todas las vías legítimas
+        echo "❌ No se puede obtener la imagen declarada '$image' para '$svc'."
+        echo "   El instalador universal NO sustituirá automáticamente por ':latest'."
+        exit 1
     done
 }
 
@@ -834,7 +812,6 @@ VOLUME_POLICY=INSTANCE_ISOLATED
 DESTRUCTIVE_VOLUME_OPERATION=NEVER_AUTOMATIC
 EOF
 
-# Guardar lista de recursos renderizados para auditoría.
 {
     echo "# Recursos renderizados para $NOMBRE_CARPETA"
     cat "$ANALYSIS_FILE"
@@ -851,8 +828,6 @@ echo "💾 Política         : volumen nuevo/aislado"
 echo "🛑 No se ejecutará  : docker compose down -v"
 echo ""
 
-# NO hacemos down: esta ejecución ya tiene un proyecto único. Esto evita que una
-# detección incorrecta pueda afectar otra instancia.
 docker compose \
     --env-file "$INSTANCE_ENV" \
     -f "$COMPOSE_FILE" \
@@ -907,8 +882,6 @@ done
                 docker exec "$DB_CONTAINER" pg_isready >/dev/null 2>&1 && DB_READY=1 || true
                 ;;
             *)
-                # Si no se pudo identificar motor, el estado running es la única
-                # comprobación genérica segura que podemos hacer.
                 DB_READY=1
                 ;;
         esac
