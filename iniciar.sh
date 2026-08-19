@@ -193,7 +193,13 @@ else
         exit 1
     fi
     $SUDO mkdir -p "$ESCRITORIO"
-    $SUDO -u "$SUDO_USER_NAME" git clone "$REPO_URL" "$REPO_DIR"
+    if [ -n "$SUDO" ]; then
+        $SUDO -u "$SUDO_USER_NAME" git clone "$REPO_URL" "$REPO_DIR"
+    elif command_exists runuser; then
+        runuser -u "$SUDO_USER_NAME" -- git clone "$REPO_URL" "$REPO_DIR"
+    else
+        git clone "$REPO_URL" "$REPO_DIR"
+    fi
 fi
 
 $SUDO chown -R "$SUDO_USER_NAME:$SUDO_USER_NAME" "$REPO_DIR" 2>/dev/null || true
@@ -264,16 +270,6 @@ else
     echo "ℹ️  No se detectó automáticamente un servicio de base de datos."
 fi
 
-DB_ENGINE=""
-if [ -n "$DB_SERVICE" ]; then
-    DB_IMAGE=$(docker compose -f "$COMPOSE_FILE" config | awk -v svc="$DB_SERVICE" '$0 ~ "^  "svc":" {found=1} found && /image:/ {print $2; exit}') || true
-    case "$DB_IMAGE" in
-        *mariadb*) DB_ENGINE="mariadb" ;;
-        *mysql*) DB_ENGINE="mysql" ;;
-        *postgres*) DB_ENGINE="postgres" ;;
-    esac
-fi
-
 # Detectar nombres habituales desde compose config.
 COMPOSE_CONFIG=$(docker compose -f "$COMPOSE_FILE" config)
 DB_NAME_DETECTED=""
@@ -283,6 +279,7 @@ ROOT_PASSWORD_DETECTED=""
 
 # Compose config suele mostrar estos valores como texto plano. Se busca dentro
 # del servicio detectado sin depender de yq ni de expresiones YAML complejas.
+SERVICE_BLOCK=""
 if [ -n "$DB_SERVICE" ]; then
     SERVICE_BLOCK=$(printf '%s\n' "$COMPOSE_CONFIG" | awk -v svc="$DB_SERVICE" '
         $0 == "  " svc ":" {inside=1; next}
@@ -294,6 +291,18 @@ if [ -n "$DB_SERVICE" ]; then
     DB_USER_DETECTED=$(printf '%s\n' "$SERVICE_BLOCK" | grep -E '^[[:space:]]+(MYSQL_USER|MARIADB_USER|POSTGRES_USER):' | head -n1 | sed -E 's/^[^:]+:[[:space:]]*//; s/^"//; s/"$//; s/^'"'"'//; s/'"'"'$//' || true)
     DB_PASSWORD_DETECTED=$(printf '%s\n' "$SERVICE_BLOCK" | grep -E '^[[:space:]]+(MYSQL_PASSWORD|MARIADB_PASSWORD|POSTGRES_PASSWORD):' | head -n1 | sed -E 's/^[^:]+:[[:space:]]*//; s/^"//; s/"$//; s/^'"'"'//; s/'"'"'$//' || true)
     ROOT_PASSWORD_DETECTED=$(printf '%s\n' "$SERVICE_BLOCK" | grep -E '^[[:space:]]+(MYSQL_ROOT_PASSWORD|MARIADB_ROOT_PASSWORD):' | head -n1 | sed -E 's/^[^:]+:[[:space:]]*//; s/^"//; s/"$//; s/^'"'"'//; s/'"'"'$//' || true)
+fi
+
+# DB_IMAGE se extrae del SERVICE_BLOCK ya acotado al servicio de BD, para no
+# arrastrar por error la 'image:' de otro servicio que venga a continuación.
+DB_ENGINE=""
+if [ -n "$DB_SERVICE" ]; then
+    DB_IMAGE=$(printf '%s\n' "$SERVICE_BLOCK" | grep -E '^[[:space:]]+image:' | head -n1 | sed -E 's/^[^:]+:[[:space:]]*//; s/^"//; s/"$//; s/^'"'"'//; s/'"'"'$//' || true)
+    case "$DB_IMAGE" in
+        *mariadb*) DB_ENGINE="mariadb" ;;
+        *mysql*) DB_ENGINE="mysql" ;;
+        *postgres*) DB_ENGINE="postgres" ;;
+    esac
 fi
 
 # ============================================================================== 
@@ -387,14 +396,14 @@ fi
 CONTADOR=1
 while true; do
     CARPETA_DESTINO="$ESCRITORIO/P${CONTADOR}"
-    if [ ! -e "$CARPETA_DESTINO" ] && ! docker ps -a --format '{{.Names}}' | grep -q "^p${CONTADOR}_"; then
+    if [ ! -e "$CARPETA_DESTINO" ] && ! docker ps -a --format '{{.Names}}' | grep -q "^P${CONTADOR}_"; then
         break
     fi
     CONTADOR=$((CONTADOR + 1))
 done
 
 NOMBRE_CARPETA="P${CONTADOR}"
-COMPOSE_PROJECT_NAME="p${CONTADOR}"
+COMPOSE_PROJECT_NAME="$NOMBRE_CARPETA"
 mkdir -p "$CARPETA_DESTINO"
 
 # El archivo de compose queda también dentro de Pn para que el despliegue tenga
@@ -444,6 +453,47 @@ DB_PASSWORD=${DB_APP_PASS}
 ENVFILE
 
 # ============================================================================== 
+# 5.1 Preflight: cada servicio debe ser construible o descargable
+# ============================================================================== 
+# Si un servicio solo tiene 'image:' (sin 'build:'), esa imagen debe existir ya
+# localmente o en algún registro accesible. Si no, en vez de dejar que 'docker
+# compose up' falle con un error genérico de pull, se avisa explícitamente y
+# se pregunta cómo continuar (coherente con "si no se puede determinar, se
+# pregunta, no se asume").
+preflight_check_images() {
+    local svc image has_build opt
+    for svc in "${SERVICES[@]}"; do
+        has_build=$(printf '%s\n' "$COMPOSE_CONFIG" | awk -v s="  $svc:" '
+            $0==s{inside=1;next} inside && /^  [A-Za-z0-9_.-]+:$/{exit}
+            inside && /^ *build:/{print "1"; exit}')
+        image=$(printf '%s\n' "$COMPOSE_CONFIG" | awk -v s="  $svc:" '
+            $0==s{inside=1;next} inside && /^  [A-Za-z0-9_.-]+:$/{exit}
+            inside && /^ *image:/{print $2; exit}')
+
+        [ -n "$has_build" ] && continue   # se construye localmente, OK
+        [ -z "$image" ] && continue        # sin image ni build, no aplica
+
+        if docker image inspect "$image" >/dev/null 2>&1; then
+            continue                       # ya existe localmente
+        fi
+        if docker manifest inspect "$image" >/dev/null 2>&1; then
+            continue                       # se puede descargar de un registro
+        fi
+
+        echo "⚠️  El servicio '$svc' usa la imagen '$image', que no tiene 'build:',"
+        echo "    no existe localmente y no se puede descargar de ningún registro."
+        echo "    1) Cancelar el despliegue"
+        echo "    2) Continuar de todas formas (probablemente fallará)"
+        read -r -p "👉 Selección [1]: " opt
+        opt=${opt:-1}
+        if [ "$opt" != "2" ]; then
+            echo "❌ Despliegue cancelado: prepara un 'build:' para '$svc' o publica la imagen '$image'."
+            exit 1
+        fi
+    done
+}
+
+# ============================================================================== 
 # 6. Levantar Compose
 # ============================================================================== 
 echo "================================================="
@@ -455,6 +505,8 @@ export COMPOSE_PROJECT_NAME PREFIX_CONTENEDOR="$COMPOSE_PROJECT_NAME"
 export PROJECT_NAME="$SYSTEM_NAME" PROJECT_SOURCE="$REPO_DIR"
 export PUERTO_WEB PUERTO_PMA PUERTO_DB PUERTO_SSL
 export DB_DATABASE="$DB_NAME" DB_USERNAME="$DB_APP_USER" DB_PASSWORD="$DB_APP_PASS"
+
+preflight_check_images
 
 # --project-directory mantiene los build contexts y rutas relativas del repositorio.
 docker compose -f "$COMPOSE_FILE" --project-directory "$REPO_DIR" -p "$COMPOSE_PROJECT_NAME" down >/dev/null 2>&1 || true
