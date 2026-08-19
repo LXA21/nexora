@@ -1,6 +1,6 @@
 #!/bin/bash
 set -Eeuo pipefail
-
+ 
 # ============================================================================== 
 # SUPER INSTALLER UNIVERSAL - Docker / Docker Compose / MySQL / MariaDB
 # - Repositorio configurable
@@ -11,31 +11,31 @@ set -Eeuo pipefail
 # - BD vacía o inicializada desde SQL
 # - Usuario BD opcional y permisos configurables
 # ============================================================================== 
-
+ 
 trap 'echo "❌ Error en la línea $LINENO. El despliegue se detuvo."' ERR
-
+ 
 SUDO=""
 if [ "$EUID" -ne 0 ]; then SUDO="sudo"; fi
-
+ 
 pause_read() { :; }
-
+ 
 command_exists() { command -v "$1" >/dev/null 2>&1; }
-
+ 
 sanitize_name() {
     echo "$1" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9._-]/-/g; s/^-*//; s/-*$//'
 }
-
+ 
 sql_escape() {
     printf "%s" "$1" | sed "s/'/''/g"
 }
-
+ 
 # ============================================================================== 
 # 0. Docker y herramientas base
 # ============================================================================== 
 echo "================================================="
 echo "🐳 0. Verificando Docker y herramientas..."
 echo "================================================="
-
+ 
 if ! command_exists docker; then
     echo "⚙️  Docker no está instalado. Instalando desde el repositorio oficial..."
     $SUDO apt-get update -y
@@ -50,7 +50,7 @@ if ! command_exists docker; then
 else
     echo "✅ Docker ya está instalado."
 fi
-
+ 
 for pkg in git unzip iproute2; do
     if ! command_exists "$pkg"; then
         echo "⚙️  Instalando $pkg..."
@@ -58,39 +58,39 @@ for pkg in git unzip iproute2; do
         $SUDO apt-get install -y "$pkg"
     fi
 done
-
+ 
 if ! docker compose version >/dev/null 2>&1; then
     echo "❌ Docker Compose v2 no está disponible. Instala docker-compose-plugin y vuelve a ejecutar."
     exit 1
 fi
-
+ 
 if ! docker info >/dev/null 2>&1; then
     echo "⚡ Iniciando Docker..."
     $SUDO systemctl enable --now docker 2>/dev/null || $SUDO service docker start
 fi
-
+ 
 # ============================================================================== 
 # 0.1 Usuario administrativo sudo
 # ============================================================================== 
 echo "================================================="
 echo "👤 0.1 Configuración del usuario administrativo"
 echo "================================================="
-
+ 
 SUDO_USER_NAME="${1:-}"
 SUDO_USER_PASS="${2-}"
 PASS_FROM_ARG=0
-
+ 
 if [ -n "$SUDO_USER_PASS" ]; then PASS_FROM_ARG=1; fi
-
+ 
 if [ -z "$SUDO_USER_NAME" ]; then
     read -r -p "👉 Nombre del usuario sudo a crear/usar: " SUDO_USER_NAME
 fi
-
+ 
 if [ -z "$SUDO_USER_NAME" ]; then
     echo "❌ El nombre de usuario no puede estar vacío."
     exit 1
 fi
-
+ 
 if ! id "$SUDO_USER_NAME" >/dev/null 2>&1; then
     if [ "$PASS_FROM_ARG" -eq 0 ]; then
         read -r -s -p "👉 Contraseña para '$SUDO_USER_NAME' (ENTER = sin contraseña): " SUDO_USER_PASS
@@ -109,7 +109,7 @@ else
         $SUDO usermod -aG sudo "$SUDO_USER_NAME"
     fi
 fi
-
+ 
 if [ -n "$SUDO_USER_PASS" ]; then
     printf '%s:%s\n' "$SUDO_USER_NAME" "$SUDO_USER_PASS" | $SUDO chpasswd
     echo "✅ Contraseña establecida/actualizada."
@@ -117,19 +117,19 @@ else
     $SUDO passwd -d "$SUDO_USER_NAME" >/dev/null 2>&1 || true
     echo "✅ Campo de contraseña vacío: el usuario queda sin contraseña."
 fi
-
+ 
 for U in "$USER" "$SUDO_USER_NAME"; do
     if id "$U" >/dev/null 2>&1 && ! id -nG "$U" 2>/dev/null | grep -qw docker; then
         $SUDO usermod -aG docker "$U" 2>/dev/null || true
     fi
 done
-
+ 
 # ============================================================================== 
 # 0.2 Detectar escritorio y solicitar repositorio
 # ============================================================================== 
 USER_HOME=$(getent passwd "$SUDO_USER_NAME" | cut -d: -f6)
 [ -n "$USER_HOME" ] || USER_HOME="$HOME"
-
+ 
 if [ -d "$USER_HOME/Desktop" ]; then
     ESCRITORIO="$USER_HOME/Desktop"
 elif [ -d "$USER_HOME/Escritorio" ]; then
@@ -139,25 +139,25 @@ else
     $SUDO mkdir -p "$ESCRITORIO"
     $SUDO chown "$SUDO_USER_NAME:$SUDO_USER_NAME" "$ESCRITORIO" 2>/dev/null || true
 fi
-
+ 
 SCRIPT_ACTUAL="$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
-
+ 
 # Si el script viene de un repositorio, no se vuelve a clonar sobre sí mismo.
 read -r -p "👉 URL del repositorio Git: " REPO_URL
 [ -n "$REPO_URL" ] || { echo "❌ Debes indicar una URL de repositorio."; exit 1; }
-
+ 
 REPO_BASENAME=$(basename "${REPO_URL%/}")
 REPO_BASENAME=${REPO_BASENAME%.git}
 DEFAULT_SYSTEM_NAME=$(sanitize_name "$REPO_BASENAME")
 [ -n "$DEFAULT_SYSTEM_NAME" ] || DEFAULT_SYSTEM_NAME="sistema"
-
+ 
 read -r -p "👉 Nombre del sistema [$DEFAULT_SYSTEM_NAME]: " SYSTEM_NAME
 SYSTEM_NAME=${SYSTEM_NAME:-$DEFAULT_SYSTEM_NAME}
 SYSTEM_NAME=$(sanitize_name "$SYSTEM_NAME")
 [ -n "$SYSTEM_NAME" ] || { echo "❌ Nombre de sistema inválido."; exit 1; }
-
+ 
 REPO_DIR="$ESCRITORIO/$SYSTEM_NAME"
-
+ 
 # ============================================================================== 
 # 0.3 Evitar colisión en carpeta del sistema
 # ============================================================================== 
@@ -174,14 +174,14 @@ if [ -e "$REPO_DIR" ]; then
         exit 1
     fi
 fi
-
+ 
 # ============================================================================== 
 # 0.4 Clonar/actualizar repositorio
 # ============================================================================== 
 echo "================================================="
 echo "📥 0.4 Sincronizando: $SYSTEM_NAME"
 echo "================================================="
-
+ 
 if [ -d "$REPO_DIR/.git" ]; then
     git -C "$REPO_DIR" remote set-url origin "$REPO_URL"
     git -C "$REPO_DIR" pull --ff-only || {
@@ -201,12 +201,12 @@ else
         git clone "$REPO_URL" "$REPO_DIR"
     fi
 fi
-
+ 
 $SUDO chown -R "$SUDO_USER_NAME:$SUDO_USER_NAME" "$REPO_DIR" 2>/dev/null || true
 chmod +x "$REPO_DIR/iniciar.sh" 2>/dev/null || true
-
+ 
 echo "✅ Código fuente disponible en: $REPO_DIR"
-
+ 
 # ============================================================================== 
 # 0.5 Extraer ZIP si existe
 # ============================================================================== 
@@ -226,35 +226,35 @@ if [ -n "$ZIP_FILE" ]; then
     rm -rf "$TMP_EXTRACT"
     echo "✅ ZIP extraído."
 fi
-
+ 
 # ============================================================================== 
 # 1. Análisis automático del proyecto
 # ============================================================================== 
 echo "================================================="
 echo "🔎 1. Analizando el proyecto..."
 echo "================================================="
-
+ 
 COMPOSE_FILE=""
 if [ -f "$REPO_DIR/docker-compose.yml" ]; then
     COMPOSE_FILE="$REPO_DIR/docker-compose.yml"
 elif [ -f "$REPO_DIR/docker-compose.yaml" ]; then
     COMPOSE_FILE="$REPO_DIR/docker-compose.yaml"
 fi
-
+ 
 DOCKERFILE="$REPO_DIR/Dockerfile"
 if [ -f "$DOCKERFILE" ]; then echo "✅ Dockerfile encontrado"; else echo "ℹ️  Dockerfile no encontrado"; fi
 if [ -n "$COMPOSE_FILE" ]; then echo "✅ Compose encontrado: $(basename "$COMPOSE_FILE")"; else echo "❌ No se encontró docker-compose.yml/.yaml"; exit 1; fi
-
+ 
 # Necesario para analizar YAML sin depender de yq: usamos docker compose config.
 cd "$REPO_DIR"
-
+ 
 echo "🔧 Validando Docker Compose..."
 docker compose -f "$COMPOSE_FILE" config >/dev/null
-
+ 
 echo "📋 Servicios detectados:"
 mapfile -t SERVICES < <(docker compose -f "$COMPOSE_FILE" config --services)
 for SVC in "${SERVICES[@]}"; do echo "   • $SVC"; done
-
+ 
 DB_SERVICE=""
 for SVC in "${SERVICES[@]}"; do
     SVC_LOWER=$(echo "$SVC" | tr '[:upper:]' '[:lower:]')
@@ -263,20 +263,20 @@ for SVC in "${SERVICES[@]}"; do
         break
     fi
 done
-
+ 
 if [ -n "$DB_SERVICE" ]; then
     echo "🗄️  Servicio de base de datos detectado: $DB_SERVICE"
 else
     echo "ℹ️  No se detectó automáticamente un servicio de base de datos."
 fi
-
+ 
 # Detectar nombres habituales desde compose config.
 COMPOSE_CONFIG=$(docker compose -f "$COMPOSE_FILE" config)
 DB_NAME_DETECTED=""
 DB_USER_DETECTED=""
 DB_PASSWORD_DETECTED=""
 ROOT_PASSWORD_DETECTED=""
-
+ 
 # Compose config suele mostrar estos valores como texto plano. Se busca dentro
 # del servicio detectado sin depender de yq ni de expresiones YAML complejas.
 SERVICE_BLOCK=""
@@ -286,13 +286,13 @@ if [ -n "$DB_SERVICE" ]; then
         inside && /^  [A-Za-z0-9_.-]+:$/ {exit}
         inside {print}
     ')
-
+ 
     DB_NAME_DETECTED=$(printf '%s\n' "$SERVICE_BLOCK" | grep -E '^[[:space:]]+(MYSQL_DATABASE|MARIADB_DATABASE|POSTGRES_DB):' | head -n1 | sed -E 's/^[^:]+:[[:space:]]*//; s/^"//; s/"$//; s/^'"'"'//; s/'"'"'$//' || true)
     DB_USER_DETECTED=$(printf '%s\n' "$SERVICE_BLOCK" | grep -E '^[[:space:]]+(MYSQL_USER|MARIADB_USER|POSTGRES_USER):' | head -n1 | sed -E 's/^[^:]+:[[:space:]]*//; s/^"//; s/"$//; s/^'"'"'//; s/'"'"'$//' || true)
     DB_PASSWORD_DETECTED=$(printf '%s\n' "$SERVICE_BLOCK" | grep -E '^[[:space:]]+(MYSQL_PASSWORD|MARIADB_PASSWORD|POSTGRES_PASSWORD):' | head -n1 | sed -E 's/^[^:]+:[[:space:]]*//; s/^"//; s/"$//; s/^'"'"'//; s/'"'"'$//' || true)
     ROOT_PASSWORD_DETECTED=$(printf '%s\n' "$SERVICE_BLOCK" | grep -E '^[[:space:]]+(MYSQL_ROOT_PASSWORD|MARIADB_ROOT_PASSWORD):' | head -n1 | sed -E 's/^[^:]+:[[:space:]]*//; s/^"//; s/"$//; s/^'"'"'//; s/'"'"'$//' || true)
 fi
-
+ 
 # DB_IMAGE se extrae del SERVICE_BLOCK ya acotado al servicio de BD, para no
 # arrastrar por error la 'image:' de otro servicio que venga a continuación.
 DB_ENGINE=""
@@ -304,14 +304,14 @@ if [ -n "$DB_SERVICE" ]; then
         *postgres*) DB_ENGINE="postgres" ;;
     esac
 fi
-
+ 
 # ============================================================================== 
 # 2. Selección de BD y SQL
 # ============================================================================== 
 DB_MODE="none"
 DB_NAME="${DB_NAME_DETECTED:-}"
 SQL_FILE=""
-
+ 
 if [ -n "$DB_SERVICE" ]; then
     echo "================================================="
     echo "🗄️  2. CONFIGURACIÓN DE BASE DE DATOS"
@@ -322,14 +322,14 @@ if [ -n "$DB_SERVICE" ]; then
     read -r -p "👉 Selección [1]: " DB_MODE
     DB_MODE=${DB_MODE:-1}
     case "$DB_MODE" in 1|2|3) ;; *) echo "❌ Selección inválida."; exit 1 ;; esac
-
+ 
     if [ -z "$DB_NAME" ]; then
         read -r -p "👉 Nombre de la base de datos: " DB_NAME
     else
         read -r -p "👉 Nombre de la base de datos [$DB_NAME]: " INPUT_DB_NAME
         DB_NAME=${INPUT_DB_NAME:-$DB_NAME}
     fi
-
+ 
     if [ "$DB_MODE" = "2" ]; then
         mapfile -t SQL_FILES < <(find "$REPO_DIR" -type f \( -iname '*.sql' -o -iname '*.sql.gz' \) ! -path '*/.git/*' | sort)
         if [ "${#SQL_FILES[@]}" -eq 0 ]; then
@@ -351,7 +351,7 @@ if [ -n "$DB_SERVICE" ]; then
 else
     DB_MODE="none"
 fi
-
+ 
 # ============================================================================== 
 # 3. Usuario de BD y permisos
 # ============================================================================== 
@@ -359,7 +359,7 @@ DB_APP_USER=""
 DB_APP_PASS=""
 GRANT_MODE="none"
 CREATE_DB_USER="2"
-
+ 
 if [ -n "$DB_SERVICE" ] && [ "$DB_MODE" != "none" ]; then
     echo "================================================="
     echo "👤 3. USUARIO DE BASE DE DATOS"
@@ -368,7 +368,7 @@ if [ -n "$DB_SERVICE" ] && [ "$DB_MODE" != "none" ]; then
     echo "2) No crear usuario"
     read -r -p "👉 Selección [1]: " CREATE_DB_USER
     CREATE_DB_USER=${CREATE_DB_USER:-1}
-
+ 
     if [ "$CREATE_DB_USER" = "1" ]; then
         DB_APP_USER="${DB_USER_DETECTED:-}"
         if [ -n "$DB_APP_USER" ]; then
@@ -377,10 +377,10 @@ if [ -n "$DB_SERVICE" ] && [ "$DB_MODE" != "none" ]; then
         else
             read -r -p "👉 Usuario BD: " DB_APP_USER
         fi
-
+ 
         read -r -s -p "👉 Contraseña BD (ENTER = sin contraseña): " DB_APP_PASS
         echo ""
-
+ 
         echo "¿Qué permisos tendrá '$DB_APP_USER'?"
         echo "1) Todos los permisos SOLO sobre '$DB_NAME'"
         echo "2) Permisos básicos de aplicación"
@@ -389,7 +389,7 @@ if [ -n "$DB_SERVICE" ] && [ "$DB_MODE" != "none" ]; then
         GRANT_MODE=${GRANT_MODE:-1}
     fi
 fi
-
+ 
 # ============================================================================== 
 # 4. Crear carpeta de despliegue P1/P2/P3... en el Escritorio
 # ============================================================================== 
@@ -401,32 +401,32 @@ while true; do
     fi
     CONTADOR=$((CONTADOR + 1))
 done
-
+ 
 NOMBRE_CARPETA="P${CONTADOR}"
 # Docker Compose exige nombres de proyecto en minúsculas (solo [a-z0-9_-],
 # empezando por letra o número). La carpeta visual (P1, P2...) puede seguir
 # en mayúscula porque es solo un nombre de directorio, son cosas distintas.
 COMPOSE_PROJECT_NAME=$(sanitize_name "$NOMBRE_CARPETA")
 mkdir -p "$CARPETA_DESTINO"
-
+ 
 # El archivo de compose queda también dentro de Pn para que el despliegue tenga
 # una carpeta propia y fácil de localizar. El contexto real sigue siendo el repo.
 cp "$COMPOSE_FILE" "$CARPETA_DESTINO/$(basename "$COMPOSE_FILE")"
 [ -f "$REPO_DIR/.env.example" ] && cp "$REPO_DIR/.env.example" "$CARPETA_DESTINO/.env.example" || true
-
+ 
 # ============================================================================== 
 # 5. Puertos y variables genéricas
 # ============================================================================== 
 echo "================================================="
 echo "🔌 4. Asignando puertos y variables..."
 echo "================================================="
-
+ 
 NUM_INSTANCIA=$((CONTADOR - 1))
 PUERTO_WEB_ORIGINAL=$((1080 + NUM_INSTANCIA * 2))
 PUERTO_PMA_ORIGINAL=$((8081 + NUM_INSTANCIA * 2))
 PUERTO_DB_ORIGINAL=$((3307 + NUM_INSTANCIA))
 PUERTO_SSL_ORIGINAL=$((8443 + NUM_INSTANCIA * 2))
-
+ 
 verificar_y_corregir() {
     local puerto="$1"
     local incremento="$2"
@@ -435,12 +435,12 @@ verificar_y_corregir() {
     done
     echo "$puerto"
 }
-
+ 
 PUERTO_WEB=$(verificar_y_corregir "$PUERTO_WEB_ORIGINAL" 2)
 PUERTO_PMA=$(verificar_y_corregir "$PUERTO_PMA_ORIGINAL" 2)
 PUERTO_DB=$(verificar_y_corregir "$PUERTO_DB_ORIGINAL" 1)
 PUERTO_SSL=$(verificar_y_corregir "$PUERTO_SSL_ORIGINAL" 2)
-
+ 
 cat > "$CARPETA_DESTINO/.env" <<ENVFILE
 COMPOSE_PROJECT_NAME=${COMPOSE_PROJECT_NAME}
 PREFIX_CONTENEDOR=${COMPOSE_PROJECT_NAME}
@@ -454,7 +454,7 @@ DB_DATABASE=${DB_NAME}
 DB_USERNAME=${DB_APP_USER}
 DB_PASSWORD=${DB_APP_PASS}
 ENVFILE
-
+ 
 # ============================================================================== 
 # 5.1 Preflight: cada servicio debe ser construible o descargable
 # ============================================================================== 
@@ -463,7 +463,7 @@ ENVFILE
 # compose up' falle con un error genérico de pull, se avisa explícitamente y
 # se pregunta cómo continuar (coherente con "si no se puede determinar, se
 # pregunta, no se asume").
-
+ 
 # Busca, entre TODOS los Dockerfile del repositorio (sin importar en qué
 # carpeta estén), el que mejor corresponde a un servicio. Empareja por
 # palabras clave: nombre del servicio, tokens del nombre de la imagen y,
@@ -476,10 +476,10 @@ match_dockerfile_for_service() {
     local svc="$1" image="$2"
     local svc_lower kw path_lower score best_score=0 image_no_tag entry sel i d
     local -a keyword_list=() img_tokens=() scored_paths=() best_paths=()
-
+ 
     svc_lower=$(echo "$svc" | tr '[:upper:]' '[:lower:]')
     keyword_list+=("$svc_lower")
-
+ 
     image_no_tag="${image%%:*}"
     local IFS='/_.-'
     read -r -a img_tokens <<< "$image_no_tag"
@@ -488,13 +488,13 @@ match_dockerfile_for_service() {
         kw=$(echo "$kw" | tr '[:upper:]' '[:lower:]')
         [ -n "$kw" ] && keyword_list+=("$kw")
     done
-
+ 
     if [ -n "$DB_SERVICE" ] && [ "$svc" = "$DB_SERVICE" ] && [ -n "$DB_ENGINE" ]; then
         keyword_list+=("$DB_ENGINE")
         [ "$DB_ENGINE" = "mariadb" ] && keyword_list+=("mysql")
         [ "$DB_ENGINE" = "mysql" ] && keyword_list+=("mariadb")
     fi
-
+ 
     for d in "${all_dockerfiles[@]}"; do
         path_lower=$(echo "${d#$REPO_DIR/}" | tr '[:upper:]' '[:lower:]')
         score=0
@@ -508,9 +508,9 @@ match_dockerfile_for_service() {
         done
         [ "$score" -gt 0 ] && scored_paths+=("$score|$d")
     done
-
+ 
     [ "${#scored_paths[@]}" -eq 0 ] && return 0
-
+ 
     for entry in "${scored_paths[@]}"; do
         local s="${entry%%|*}"
         [ "$s" -gt "$best_score" ] && best_score="$s"
@@ -519,12 +519,12 @@ match_dockerfile_for_service() {
         local s="${entry%%|*}"
         [ "$s" -eq "$best_score" ] && best_paths+=("${entry#*|}")
     done
-
+ 
     if [ "${#best_paths[@]}" -eq 1 ]; then
         echo "${best_paths[0]}"
         return 0
     fi
-
+ 
     echo "❓ Varios Dockerfile podrían pertenecer al servicio '$svc' (imagen '$image'):" >&2
     for i in "${!best_paths[@]}"; do
         echo "    $((i+1))) ${best_paths[$i]#$REPO_DIR/}" >&2
@@ -536,7 +536,7 @@ match_dockerfile_for_service() {
     fi
     return 0
 }
-
+ 
 # Si un servicio no tiene Dockerfile propio ni imagen descargable, pero por
 # su ROL es claramente una BD conocida o un phpMyAdmin, se ofrece la imagen
 # oficial correspondiente para descargarla y volver a etiquetarla localmente
@@ -548,18 +548,42 @@ guess_upstream_image_for_service() {
     local svc="$1" image="$2"
     local svc_lower image_lower all_text t
     local -a tokens=()
-
+ 
     svc_lower=$(echo "$svc" | tr '[:upper:]' '[:lower:]')
     image_lower=$(echo "${image%%:*}" | tr '[:upper:]' '[:lower:]')
-
+ 
     if [ -n "$DB_SERVICE" ] && [ "$svc" = "$DB_SERVICE" ] && [ -n "$DB_ENGINE" ]; then
         case "$DB_ENGINE" in
             mariadb)  echo "mariadb:latest";  return 0 ;;
-            mysql)    echo "mysql:latest";    return 0 ;;
             postgres) echo "postgres:latest"; return 0 ;;
+            mysql)
+                # El nombre de la imagen sugiere "mysql", pero eso es AMBIGUO:
+                # la imagen oficial de MariaDB también acepta las variables
+                # MYSQL_* por compatibilidad, así que un tag como "mi_p1_mysql"
+                # no permite distinguir con certeza cuál de las dos es. Si el
+                # compose usa variables MARIADB_* explícitas, es señal
+                # inequívoca de MariaDB. Si no, se pregunta en vez de asumir.
+                if printf '%s\n' "$SERVICE_BLOCK" | grep -qE '^[[:space:]]+MARIADB_'; then
+                    echo "mariadb:latest"
+                    return 0
+                fi
+                echo "❓ El servicio de BD usa la imagen '$image': el nombre sugiere MySQL, pero" >&2
+                echo "    también podría ser MariaDB (son compatibles entre sí)." >&2
+                echo "    1) MariaDB (recomendado: suele ser el caso más común en este tipo de proyecto)" >&2
+                echo "    2) MySQL oficial" >&2
+                local engine_choice
+                read -r -p "👉 Selección [1]: " engine_choice
+                engine_choice=${engine_choice:-1}
+                if [ "$engine_choice" = "2" ]; then
+                    echo "mysql:latest"
+                else
+                    echo "mariadb:latest"
+                fi
+                return 0
+                ;;
         esac
     fi
-
+ 
     # Coincidencia por TOKEN completo (no subcadena) para evitar falsos
     # positivos como "pma" dentro de una palabra que no tiene relación.
     all_text="$svc_lower $image_lower"
@@ -571,15 +595,15 @@ guess_upstream_image_for_service() {
             pma|phpmyadmin|myadmin) echo "phpmyadmin:latest"; return 0 ;;
         esac
     done
-
+ 
     return 0
 }
-
+ 
 preflight_check_images() {
     local svc image has_build opt dockerfile_path build_context resolved upstream_image confirm_tag confirm_only unico
     local -a all_dockerfiles=()
     mapfile -t all_dockerfiles < <(find "$REPO_DIR" -type f \( -iname 'Dockerfile' -o -iname 'Dockerfile.*' -o -iname '*.Dockerfile' \) ! -path '*/.git/*' 2>/dev/null | sort)
-
+ 
     for svc in "${SERVICES[@]}"; do
         has_build=$(printf '%s\n' "$COMPOSE_CONFIG" | awk -v s="  $svc:" '
             $0==s{inside=1;next} inside && /^  [A-Za-z0-9_.-]+:$/{exit}
@@ -587,22 +611,22 @@ preflight_check_images() {
         image=$(printf '%s\n' "$COMPOSE_CONFIG" | awk -v s="  $svc:" '
             $0==s{inside=1;next} inside && /^  [A-Za-z0-9_.-]+:$/{exit}
             inside && /^ *image:/{print $2; exit}')
-
+ 
         [ -n "$has_build" ] && continue   # se construye localmente, OK
         [ -z "$image" ] && continue        # sin image ni build, no aplica
-
+ 
         if docker image inspect "$image" >/dev/null 2>&1; then
             continue                       # ya existe localmente
         fi
         if docker manifest inspect "$image" >/dev/null 2>&1; then
             continue                       # se puede descargar de un registro
         fi
-
+ 
         # Ninguna de las anteriores aplicó: se prueban, en orden, tres
         # estrategias de recuperación automática antes de advertir/fallar.
         # Cada una pide confirmación cuando implica una suposición.
         resolved=0
-
+ 
         # 1) Un Dockerfile del repo emparejado por palabras clave.
         dockerfile_path=""
         if [ "${#all_dockerfiles[@]}" -gt 0 ]; then
@@ -619,7 +643,7 @@ preflight_check_images() {
                 echo "❌ Falló la construcción automática de la imagen '$image' para '$svc'."
             fi
         fi
-
+ 
         # 2) ¿Es la BD detectada o "huele" a phpMyAdmin? Ofrecer la imagen
         #    oficial y re-etiquetarla localmente con el nombre pedido.
         if [ "$resolved" -eq 0 ]; then
@@ -639,7 +663,7 @@ preflight_check_images() {
                 fi
             fi
         fi
-
+ 
         # 3) Último recurso: si en TODO el repo hay un único Dockerfile
         #    (típico de un proyecto con un solo servicio de aplicación),
         #    ofrecerlo aunque su ruta no haya coincidido por palabras clave.
@@ -659,9 +683,9 @@ preflight_check_images() {
                 fi
             fi
         fi
-
+ 
         [ "$resolved" -eq 1 ] && continue
-
+ 
         echo "⚠️  El servicio '$svc' usa la imagen '$image', que no tiene 'build:',"
         echo "    no existe localmente y no se puede descargar de ningún registro."
         echo "    1) Cancelar el despliegue"
@@ -674,26 +698,26 @@ preflight_check_images() {
         fi
     done
 }
-
+ 
 # ============================================================================== 
 # 6. Levantar Compose
 # ============================================================================== 
 echo "================================================="
 echo "🐳 5. Desplegando $SYSTEM_NAME como $NOMBRE_CARPETA..."
 echo "================================================="
-
+ 
 cd "$REPO_DIR"
 export COMPOSE_PROJECT_NAME PREFIX_CONTENEDOR="$COMPOSE_PROJECT_NAME"
 export PROJECT_NAME="$SYSTEM_NAME" PROJECT_SOURCE="$REPO_DIR"
 export PUERTO_WEB PUERTO_PMA PUERTO_DB PUERTO_SSL
 export DB_DATABASE="$DB_NAME" DB_USERNAME="$DB_APP_USER" DB_PASSWORD="$DB_APP_PASS"
-
+ 
 preflight_check_images
-
+ 
 # --project-directory mantiene los build contexts y rutas relativas del repositorio.
 docker compose -f "$COMPOSE_FILE" --project-directory "$REPO_DIR" -p "$COMPOSE_PROJECT_NAME" down >/dev/null 2>&1 || true
 docker compose -f "$COMPOSE_FILE" --project-directory "$REPO_DIR" -p "$COMPOSE_PROJECT_NAME" up -d --build --remove-orphans
-
+ 
 # ============================================================================== 
 # 7. Esperar BD y detectar contenedor
 # ============================================================================== 
@@ -701,7 +725,7 @@ if [ -n "$DB_SERVICE" ] && [ "$DB_MODE" != "none" ]; then
     echo "================================================="
     echo "⏳ 6. Esperando a que '$DB_SERVICE' esté listo..."
     echo "================================================="
-
+ 
     DB_CONTAINER=""
     for intento in $(seq 1 60); do
         DB_CONTAINER=$(docker compose -f "$COMPOSE_FILE" --project-directory "$REPO_DIR" -p "$COMPOSE_PROJECT_NAME" ps -q "$DB_SERVICE" 2>/dev/null || true)
@@ -709,9 +733,18 @@ if [ -n "$DB_SERVICE" ] && [ "$DB_MODE" != "none" ]; then
         sleep 2
 done
     [ -n "$DB_CONTAINER" ] || { echo "❌ No se encontró el contenedor de BD."; exit 1; }
-
+ 
     DB_READY=0
     for intento in $(seq 1 60); do
+        DB_STATUS=$(docker inspect -f '{{.State.Status}}' "$DB_CONTAINER" 2>/dev/null || echo "desconocido")
+        if [ "$DB_STATUS" != "running" ]; then
+            echo ""
+            echo "❌ El contenedor de BD no está en ejecución (estado: $DB_STATUS)."
+            echo "    Últimas líneas de su log (la causa real del fallo suele estar aquí):"
+            docker logs --tail 40 "$DB_CONTAINER" 2>&1 | sed 's/^/    /'
+            echo "❌ La base de datos no llegó a estar disponible."
+            exit 1
+        fi
         case "$DB_ENGINE" in
             mysql|mariadb)
                 if docker exec "$DB_CONTAINER" mariadb-admin ping -u root --silent >/dev/null 2>&1 || \
@@ -731,13 +764,13 @@ done
     done
     [ "$DB_READY" -eq 1 ] || { echo "❌ La base de datos no llegó a estar disponible."; exit 1; }
     echo "✅ Base de datos lista."
-
+ 
     # ========================================================================== 
     # 8. Inicialización MySQL/MariaDB
     # ========================================================================== 
     if [[ "$DB_ENGINE" == "mysql" || "$DB_ENGINE" == "mariadb" ]]; then
         if docker exec "$DB_CONTAINER" mariadb --version >/dev/null 2>&1; then MYSQL_BIN="mariadb"; else MYSQL_BIN="mysql"; fi
-
+ 
         root_exec() {
             if [ -n "$ROOT_PASSWORD_DETECTED" ]; then
                 docker exec "$DB_CONTAINER" "$MYSQL_BIN" -u root -p"$ROOT_PASSWORD_DETECTED" "$@"
@@ -745,14 +778,14 @@ done
                 docker exec "$DB_CONTAINER" "$MYSQL_BIN" -u root "$@"
             fi
         }
-
+ 
         if [ -n "$DB_NAME" ]; then
             DB_EXISTS=$(root_exec -N -B -e "SELECT SCHEMA_NAME FROM information_schema.SCHEMATA WHERE SCHEMA_NAME='$(sql_escape "$DB_NAME")';" 2>/dev/null || true)
             if [ "$DB_EXISTS" != "$DB_NAME" ]; then
                 echo "⚙️  Creando base de datos '$DB_NAME'..."
                 root_exec -e "CREATE DATABASE IF NOT EXISTS \`$DB_NAME\`;"
             fi
-
+ 
             if [ "$DB_MODE" = "2" ] && [ -n "$SQL_FILE" ]; then
                 TABLE_COUNT=$(root_exec -N -B -e "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='$(sql_escape "$DB_NAME")';" 2>/dev/null || echo 0)
                 if [ "$TABLE_COUNT" = "0" ]; then
@@ -777,7 +810,7 @@ done
             else
                 echo "✅ BD configurada para comenzar vacía; no se importó ningún SQL."
             fi
-
+ 
             if [ -n "$DB_APP_USER" ] && [ "$CREATE_DB_USER" = "1" ]; then
                 USER_ESC=$(sql_escape "$DB_APP_USER")
                 PASS_ESC=$(sql_escape "$DB_APP_PASS")
@@ -801,7 +834,7 @@ done
         echo "ℹ️  PostgreSQL detectado. La selección de BD/SQL queda registrada, pero la creación/importación automática específica se reserva para una fase PostgreSQL dedicada."
     fi
 fi
-
+ 
 # ============================================================================== 
 # 9. Reporte final
 # ============================================================================== 
@@ -810,7 +843,7 @@ if [ -z "$IP_SERVIDOR" ]; then
     IP_SERVIDOR=$(hostname -I 2>/dev/null | tr ' ' '\n' | grep -vE '^172\.|^127\.' | head -n 1 || true)
 fi
 [ -n "$IP_SERVIDOR" ] || IP_SERVIDOR="localhost"
-
+ 
 echo ""
 echo "================================================="
 echo "🎉 ¡DESPLIEGUE EXITOSO!"
